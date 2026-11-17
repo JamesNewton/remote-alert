@@ -1,9 +1,11 @@
 #include <Arduino.h>
-#include <driver/i2s.h>
 #include <math.h>
+#include "AudioTools.h"
 
 #define SAMPLE_RATE 22050
 #define DMA_BUF_LEN 256
+
+AnalogAudioStream out;
 
 enum SoundType { 
     SOUND_NONE, 
@@ -30,20 +32,12 @@ struct BirdChirp {
 BirdChirp birdChirps[MAX_BIRD_CHIRPS];
 int birdTotalChirps = 0;
 
-void setupI2S() {
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // Maps specifically to GPIO25 (DAC1)
-        .communication_format = I2S_COMM_FORMAT_STAND_MSB,
-        .intr_alloc_flags = 0,
-        .dma_buf_count = 8, // 8 buffers provides ample headroom against underruns
-        .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = false
-    };
-    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN); // Enables GPIO25 (DAC1)
+void setupAudio() {
+    auto config = out.defaultConfig(TX_MODE);
+    config.sample_rate = SAMPLE_RATE;
+    config.channels = 1;
+    config.bits_per_sample = 16;
+    out.begin(config);
 }
 
 /*
@@ -64,8 +58,7 @@ void setupI2S() {
 
 // Synthesis task pinned to Core 1
 void AudioTask(void *pvParameters) {
-    uint16_t buffer[DMA_BUF_LEN];
-    size_t bytes_written;
+    int16_t buffer[DMA_BUF_LEN];
     
     // Doorbell state (Ding = E5 / 659.25Hz, Dong = C5 / 523.25Hz)
     const float stepDing = 2.0f * M_PI * 659.25f / SAMPLE_RATE;
@@ -190,16 +183,12 @@ void AudioTask(void *pvParameters) {
                 }
             }
 
-            // Map [-1.0, 1.0] float signal to 8-bit DAC with headroom
-            uint8_t dac8 = (uint8_t)(constrain(
-                (outSample * 0.45f + 0.5f) * 255.0f, 0.0f, 255.0f)
-            );
-            // Write to both bytes for I2S DAC format
-            buffer[i] = ((uint16_t)dac8) | (((uint16_t)dac8) << 8);
+            // Convert [-1.0, 1.0] float signal to 16-bit signed PCM
+            buffer[i] = (int16_t)constrain(outSample * 32767.0f, -32768.0f, 32767.0f);
         }
 
-        // Push samples to DMA queue
-        i2s_write(I2S_NUM_0, buffer, sizeof(buffer), &bytes_written, portMAX_DELAY);
+        // Push samples to analog audio stream (internal DAC)
+        out.write((const uint8_t *)buffer, sizeof(buffer));
     }
 }
 
@@ -258,7 +247,7 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== ESP32 Remote Alert Initialized ===");
-    setupI2S();
+    setupAudio();
     xTaskCreatePinnedToCore(AudioTask, "AudioTask", 4096, NULL, 5, NULL, 1);
     printMenu();
 }
