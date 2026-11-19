@@ -21,3 +21,23 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 Then you might be able to select the stupid alien cockroach icon from the left and clcik "Upload" under esp32dev / General. 
+
+## Configuration
+
+Copy `include/secrets.h.template` to `include/secrets.h` (this file is git-ignored to prevent credentials from being committed) and enter your Wi-Fi credentials:
+
+- **WIFI_SSID** and **WIFI_PASSWORD**: Your local Wi-Fi credentials.
+- **MQTT_USER** and **MQTT_PASSWORD**: Optional MQTT credentials (leave blank if not using broker authentication).
+
+General broker settings and topic subscriptions can be customized in [`include/config.h`](include/config.h):
+- **MQTT_BROKER**: Hostname or IP of the MQTT broker (e.g. `aaeon-desktop` or `192.168.0.163`).
+- **MQTT_PORT**: Default is `1883`.
+- **MQTT_SUB_TOPIC**: Topic filter to subscribe to (defaults to `sensor/#`).
+
+## MQTT Alert Triggering
+
+When connected to Wi-Fi and the MQTT broker:
+- The ESP32 subscribes to `sensor/#`.
+- Any MQTT message published to a topic starting with `sensor/` automatically triggers the synthesized Birdsong sound effect.
+- You can check network and MQTT connection status at any time in the Serial Monitor by pressing `4`.
+ 

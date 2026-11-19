@@ -1,11 +1,20 @@
 #include <Arduino.h>
 #include <math.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 #include "AudioTools.h"
+#include "config.h"
 
 #define SAMPLE_RATE 22050
 #define DMA_BUF_LEN 256
 
 AnalogAudioStream out;
+
+// Network & MQTT objects
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+unsigned long lastMqttReconnectAttempt = 0;
+bool wifiConnectedReported = false;
 
 enum SoundType { 
     SOUND_NONE, 
@@ -194,6 +203,7 @@ void AudioTask(void *pvParameters) {
 
 // Generates randomized chirps for the Birdsong effect (executed once outside the audio task)
 void triggerBirdSong() {
+    currentSound = SOUND_NONE; // Silence audio briefly while recomputing parameters
     birdTotalChirps = 4 + (rand() % 4); // 4 to 7 chirps
     uint32_t curSample = (uint32_t)(0.05f * SAMPLE_RATE); // 50ms initial pause
 
@@ -233,11 +243,106 @@ void triggerBirdSong() {
     currentSound = SOUND_BIRDSONG;
 }
 
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.printf("[MQTT] Message received on topic: %s (len: %u)\n", topic, length);
+    if (length > 0) {
+        Serial.print("[MQTT] Payload: ");
+        for (unsigned int i = 0; i < length && i < 128; i++) {
+            Serial.print((char)payload[i]);
+        }
+        if (length > 128) Serial.print("...");
+        Serial.println();
+    }
+
+    if (strncmp(topic, MQTT_TOPIC, sizeof(MQTT_TOPIC) - 1) == 0) {
+        Serial.println("[MQTT] -> Topic matches.");
+        char payload_str[16];
+        if (length >= sizeof(payload_str)) {
+            length = sizeof(payload_str) - 1; 
+        }
+        memcpy(payload_str, payload, length);
+        payload_str[length] = '\0'; // CRITICAL: This makes it a valid C-string
+        if (atol(payload_str) < 70) return;
+        Serial.println("[MQTT] Triggering Birdsong!");
+        triggerBirdSong();
+    }
+}
+
+void setupWiFi() {
+    if (strlen(WIFI_SSID) == 0) {
+        Serial.println("[WiFi] No SSID configured. Skipping Wi-Fi.");
+        return;
+    }
+    Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void handleNetwork() {
+    if (strlen(WIFI_SSID) == 0) return;
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiConnectedReported) {
+            wifiConnectedReported = true;
+            Serial.print("[WiFi] Connected! IP Address: ");
+            Serial.println(WiFi.localIP());
+        }
+
+        if (!mqttClient.connected()) {
+            unsigned long now = millis();
+            if (now - lastMqttReconnectAttempt > 5000) {
+                lastMqttReconnectAttempt = now;
+                Serial.printf("[MQTT] Connecting to %s:%d...\n", MQTT_BROKER, MQTT_PORT);
+
+                bool connected = false;
+                if (strlen(MQTT_USER) > 0) {
+                    connected = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD);
+                } else {
+                    connected = mqttClient.connect(MQTT_CLIENT_ID);
+                }
+
+                if (connected) {
+                    Serial.println("[MQTT] Connected successfully!");
+                    if (mqttClient.subscribe(MQTT_TOPIC_SUB)) {
+                        Serial.printf("[MQTT] Subscribed to topic: %s\n", MQTT_TOPIC_SUB);
+                    } else {
+                        Serial.printf("[MQTT] Failed to subscribe to topic: %s\n", MQTT_TOPIC_SUB);
+                    }
+                } else {
+                    Serial.printf("[MQTT] Connect failed, state=%d. Retrying in 5s...\n", mqttClient.state());
+                }
+            }
+        } else {
+            mqttClient.loop();
+        }
+    } else {
+        if (wifiConnectedReported) {
+            wifiConnectedReported = false;
+            Serial.println("[WiFi] Connection lost. Reconnecting...");
+        }
+    }
+}
+
+void printNetworkStatus() {
+    Serial.println("\n--- Network Status ---");
+    Serial.printf("WiFi SSID: %s\n", WIFI_SSID);
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi Status: Connected (IP: %s, RSSI: %d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else {
+        Serial.printf("WiFi Status: Disconnected (%d)\n", WiFi.status());
+    }
+    Serial.printf("MQTT Broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
+    Serial.printf("MQTT Status: %s\n", mqttClient.connected() ? "Connected" : "Disconnected");
+    Serial.printf("MQTT Subscribed Topic: %s\n", MQTT_TOPIC);
+    Serial.println("----------------------");
+}
+
 void printMenu() {
     Serial.println("\n=== Remote Alert Sound Menu ===");
     Serial.println(" [1] Play Doorbell (Ding-Dong)");
     Serial.println(" [2] Play Double Alert Beep");
     Serial.println(" [3] Play Random Birdsong (Synthesized Chirps)");
+    Serial.println(" [4] Network / MQTT Status");
     Serial.println(" [0] Stop / Silence");
     Serial.println("-------------------------------");
     Serial.print("Enter choice: ");
@@ -249,10 +354,17 @@ void setup() {
     Serial.println("\n=== ESP32 Remote Alert Initialized ===");
     setupAudio();
     xTaskCreatePinnedToCore(AudioTask, "AudioTask", 4096, NULL, 5, NULL, 1);
+
+    setupWiFi();
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+
     printMenu();
 }
 
 void loop() {
+    handleNetwork();
+
     if (Serial.available() > 0) {
         char ch = Serial.read();
         if (ch == '\r' || ch == '\n' || ch == ' ') return;
@@ -271,6 +383,9 @@ void loop() {
             case '3':
                 Serial.println("3 -> Triggering Random Birdsong...");
                 triggerBirdSong();
+                break;
+            case '4':
+                printNetworkStatus();
                 break;
             case '0':
             case 's':
