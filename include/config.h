@@ -16,6 +16,7 @@
 #define MQTT_PORT 1883
 #define MQTT_CLIENT_ID "ESP32-RemoteAlert"
 
-// MQTT Topic Subscription
+// MQTT Topic Subscriptions
 #define MQTT_TOPIC "sensors/radiation/cpm"
 #define MQTT_TOPIC_SUB MQTT_TOPIC "/#"
+#define MQTT_TOPIC_TTS "alert/tts"

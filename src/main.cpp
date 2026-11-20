@@ -3,12 +3,83 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "AudioTools.h"
+#include "FileSystems.h"
+#include "espeak.h"
 #include "config.h"
 
 #define SAMPLE_RATE 22050
 #define DMA_BUF_LEN 256
+#define TTS_MAX_LEN 256
+#define TTS_QUEUE_LEN 4
 
 AnalogAudioStream out;
+AnalogConfig audioConfig;
+
+void restartAudio() {
+    Serial.println("[Audio] Restarting AnalogAudioStream...");
+    out.end();
+    delay(10);
+    out.begin(audioConfig);
+}
+
+// Buffers TTS audio into exact DMA_BUF_LEN-sample (512-byte) frames so
+// AnalogAudioStream (dac_continuous) never receives tiny/odd-sized writes
+// and eSpeak's internal buffer is never mutated in-place.
+class TtsOutAdapter : public Print {
+public:
+    static constexpr size_t FRAME_BYTES = DMA_BUF_LEN * sizeof(int16_t);
+
+    size_t write(uint8_t b) override { return write(&b, 1); }
+
+    size_t write(const uint8_t *buffer, size_t size) override {
+        size_t offset = 0;
+        while (offset < size) {
+            size_t space = FRAME_BYTES - pendingLen;
+            size_t toCopy = (size - offset < space) ? (size - offset) : space;
+            memcpy(pending + pendingLen, buffer + offset, toCopy);
+            pendingLen += toCopy;
+            offset += toCopy;
+
+            if (pendingLen == FRAME_BYTES) {
+                if (!writeFrame(pending)) {
+                    return offset;
+                }
+                pendingLen = 0;
+            }
+        }
+        return offset;
+    }
+
+    void flushFrame() {
+        if (pendingLen > 0) {
+            memset(pending + pendingLen, 0, FRAME_BYTES - pendingLen);
+            writeFrame(pending);
+            pendingLen = 0;
+        }
+    }
+
+private:
+    uint8_t pending[FRAME_BYTES] = {0};
+    size_t pendingLen = 0;
+
+    bool writeFrame(const uint8_t *frame) {
+        size_t written = out.write(frame, FRAME_BYTES);
+        if (written == 0) {
+            Serial.println("[TTS-OUT] ERROR: out.write() timed out, recovering audio...");
+            restartAudio();
+            written = out.write(frame, FRAME_BYTES);
+        }
+        return written > 0;
+    }
+};
+TtsOutAdapter ttsOut;
+ESpeak espeak(ttsOut);
+bool espeakReady = false;
+
+struct TtsMessage {
+    char text[TTS_MAX_LEN];
+};
+QueueHandle_t ttsQueue = nullptr;
 
 // Network & MQTT objects
 WiFiClient espClient;
@@ -42,11 +113,22 @@ BirdChirp birdChirps[MAX_BIRD_CHIRPS];
 int birdTotalChirps = 0;
 
 void setupAudio() {
-    auto config = out.defaultConfig(TX_MODE);
-    config.sample_rate = SAMPLE_RATE;
-    config.channels = 1;
-    config.bits_per_sample = 16;
-    out.begin(config);
+    audioConfig = out.defaultConfig(TX_MODE);
+    audioConfig.sample_rate = SAMPLE_RATE;
+    audioConfig.channels = 1;
+    audioConfig.bits_per_sample = 16;
+    audioConfig.timeout = pdMS_TO_TICKS(500);
+    out.begin(audioConfig);
+    Serial.printf("[Audio] AnalogAudioStream started (buf_size=%d, buf_count=%d)\n",
+                  audioConfig.buffer_size, audioConfig.buffer_count);
+
+    espeakReady = espeak.begin(50);
+    if (espeakReady) {
+        espeak.setVoice("en");
+        Serial.println("[TTS] eSpeak NG initialized.");
+    } else {
+        Serial.println("[TTS] ERROR: eSpeak NG failed to initialize!");
+    }
 }
 
 /*
@@ -91,6 +173,28 @@ void AudioTask(void *pvParameters) {
     int birdCurrentChirp = 0;
 
     while (true) {
+        // Process any queued TTS message exclusively from AudioTask to avoid concurrent out.write()
+        TtsMessage ttsMsg;
+        if (ttsQueue != nullptr && xQueueReceive(ttsQueue, &ttsMsg, 0) == pdTRUE) {
+            currentSound = SOUND_NONE;
+            if (espeakReady) {
+                Serial.printf("[TTS] Speaking: %s (Stack HWM: %u, Free Heap: %u)\n",
+                              ttsMsg.text,
+                              (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+                              (unsigned int)ESP.getFreeHeap());
+                bool ok = espeak.say(ttsMsg.text);
+                ttsOut.flushFrame();
+                Serial.printf("[TTS] Finished (ok=%d, Stack HWM: %u, Free Heap: %u)\n",
+                              ok ? 1 : 0,
+                              (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+                              (unsigned int)ESP.getFreeHeap());
+                if (!ok) {
+                    Serial.println("[TTS] ERROR: espeak.say() failed.");
+                }
+            }
+            continue;
+        }
+
         for (int i = 0; i < DMA_BUF_LEN; i++) {
             float outSample = 0.0f;
 
@@ -197,7 +301,10 @@ void AudioTask(void *pvParameters) {
         }
 
         // Push samples to analog audio stream (internal DAC)
-        out.write((const uint8_t *)buffer, sizeof(buffer));
+        if (out.write((const uint8_t *)buffer, sizeof(buffer)) == 0) {
+            Serial.println("[Audio] ERROR: out.write() timed out, recovering audio...");
+            restartAudio();
+        }
     }
 }
 
@@ -243,6 +350,32 @@ void triggerBirdSong() {
     currentSound = SOUND_BIRDSONG;
 }
 
+void enqueueTTS(const char* text, unsigned int length) {
+    if (ttsQueue == nullptr || !espeakReady || text == nullptr || length == 0) return;
+
+    TtsMessage msg;
+    unsigned int copyLen = length < (TTS_MAX_LEN - 1) ? length : (TTS_MAX_LEN - 1);
+    unsigned int outIdx = 0;
+    for (unsigned int i = 0; i < copyLen; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '\r' || c == '\n' || c == '\t') {
+            msg.text[outIdx++] = ' ';
+        } else if (c >= 32 && c != 127) {
+            msg.text[outIdx++] = (char)c;
+        }
+    }
+    while (outIdx > 0 && msg.text[outIdx - 1] == ' ') {
+        outIdx--;
+    }
+    msg.text[outIdx] = '\0';
+
+    if (outIdx == 0) return;
+
+    if (xQueueSend(ttsQueue, &msg, 0) != pdTRUE) {
+        Serial.println("[TTS] WARNING: TTS queue full, dropping message.");
+    }
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] Message received on topic: %s (len: %u)\n", topic, length);
     if (length > 0) {
@@ -254,7 +387,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         Serial.println();
     }
 
-    if (strncmp(topic, MQTT_TOPIC, sizeof(MQTT_TOPIC) - 1) == 0) {
+    if (strcmp(topic, MQTT_TOPIC_TTS) == 0) {
+        Serial.println("[MQTT] -> TTS topic matched, queuing speech.");
+        enqueueTTS((const char*)payload, length);
+    } else if (strncmp(topic, MQTT_TOPIC, sizeof(MQTT_TOPIC) - 1) == 0) {
         Serial.println("[MQTT] -> Topic matches.");
         char payload_str[16];
         if (length >= sizeof(payload_str)) {
@@ -308,6 +444,11 @@ void handleNetwork() {
                     } else {
                         Serial.printf("[MQTT] Failed to subscribe to topic: %s\n", MQTT_TOPIC_SUB);
                     }
+                    if (mqttClient.subscribe(MQTT_TOPIC_TTS)) {
+                        Serial.printf("[MQTT] Subscribed to topic: %s\n", MQTT_TOPIC_TTS);
+                    } else {
+                        Serial.printf("[MQTT] Failed to subscribe to topic: %s\n", MQTT_TOPIC_TTS);
+                    }
                 } else {
                     Serial.printf("[MQTT] Connect failed, state=%d. Retrying in 5s...\n", mqttClient.state());
                 }
@@ -333,7 +474,11 @@ void printNetworkStatus() {
     }
     Serial.printf("MQTT Broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
     Serial.printf("MQTT Status: %s\n", mqttClient.connected() ? "Connected" : "Disconnected");
-    Serial.printf("MQTT Subscribed Topic: %s\n", MQTT_TOPIC);
+    Serial.printf("MQTT Subscribed Topics: %s, %s\n", MQTT_TOPIC_SUB, MQTT_TOPIC_TTS);
+    Serial.printf("TTS Engine: %s (Free Heap: %u bytes, Largest Block: %u bytes)\n",
+                  espeakReady ? "Ready" : "Failed",
+                  (unsigned int)ESP.getFreeHeap(),
+                  (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     Serial.println("----------------------");
 }
 
@@ -343,6 +488,7 @@ void printMenu() {
     Serial.println(" [2] Play Double Alert Beep");
     Serial.println(" [3] Play Random Birdsong (Synthesized Chirps)");
     Serial.println(" [4] Network / MQTT Status");
+    Serial.println(" [5] Test TTS (\"Alert system ready\")");
     Serial.println(" [0] Stop / Silence");
     Serial.println("-------------------------------");
     Serial.print("Enter choice: ");
@@ -352,10 +498,15 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== ESP32 Remote Alert Initialized ===");
+    ttsQueue = xQueueCreate(TTS_QUEUE_LEN, sizeof(TtsMessage));
+    if (ttsQueue == nullptr) {
+        Serial.println("[TTS] ERROR: Failed to create TTS queue!");
+    }
     setupAudio();
-    xTaskCreatePinnedToCore(AudioTask, "AudioTask", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(AudioTask, "AudioTask", 8192, NULL, 5, NULL, 1);
 
     setupWiFi();
+    mqttClient.setBufferSize(512);
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
 
@@ -387,9 +538,11 @@ void loop() {
             case '4':
                 printNetworkStatus();
                 break;
+            case '5':
+                Serial.println("5 -> Queuing TTS test...");
+                enqueueTTS("Alert system ready", 18);
+                break;
             case '0':
-            case 's':
-            case 'S':
                 Serial.println("0 -> Stopped / Silence.");
                 currentSound = SOUND_NONE;
                 break;
