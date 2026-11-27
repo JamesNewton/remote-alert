@@ -17,6 +17,9 @@
 #define MQTT_CLIENT_ID "ESP32-RemoteAlert"
 
 // MQTT Topic Subscriptions
-#define MQTT_TOPIC "sensors/radiation/cpm"
+#define MQTT_TOPIC "alert"
 #define MQTT_TOPIC_SUB MQTT_TOPIC "/#"
-#define MQTT_TOPIC_TTS "alert/tts"
+#define MQTT_TOPIC_TTS MQTT_TOPIC "/tts"
+#define MQTT_TOPIC_DOORBELL MQTT_TOPIC "/doorbell"
+#define MQTT_TOPIC_ALERT MQTT_TOPIC "/alert"
+#define MQTT_TOPIC_BIRDSONG MQTT_TOPIC "/birdsong"

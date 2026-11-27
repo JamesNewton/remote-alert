@@ -385,8 +385,21 @@ void AudioTask(void *pvParameters) {
     }
 }
 
+void triggerDoorBell() {
+    Serial.println("Doorbell");
+    soundSampleIndex = 0;
+    currentSound = SOUND_DOORBELL;
+}
+
+void triggerAlert() {
+    Serial.println("Alert");
+    soundSampleIndex = 0;
+    currentSound = SOUND_ALERT;
+}
+
 // Generates randomized chirps for the Birdsong effect (executed once outside the audio task)
 void triggerBirdSong() {
+    Serial.println("Birdsong");
     currentSound = SOUND_NONE; // Silence audio briefly while recomputing parameters
     birdTotalChirps = 4 + (rand() % 4); // 4 to 7 chirps
     uint32_t curSample = (uint32_t)(0.05f * SAMPLE_RATE); // 50ms initial pause
@@ -467,7 +480,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, MQTT_TOPIC_TTS) == 0) {
         Serial.println("[MQTT] -> TTS topic matched, queuing speech.");
         enqueueTTS((const char*)payload, length);
-    } else if (strncmp(topic, MQTT_TOPIC, sizeof(MQTT_TOPIC) - 1) == 0) {
+        return;
+    } 
+    /* else if (strncmp(topic, MQTT_TOPIC, sizeof(MQTT_TOPIC) - 1) == 0) {
         Serial.println("[MQTT] -> Topic matches.");
         char payload_str[16];
         if (length >= sizeof(payload_str)) {
@@ -478,7 +493,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (atol(payload_str) < 70) return;
         Serial.println("[MQTT] Triggering Birdsong!");
         triggerBirdSong();
+    } */
+
+    std::unordered_map<std::string, std::function<void()>> commands = {
+        {MQTT_TOPIC_DOORBELL, triggerDoorBell},
+        {MQTT_TOPIC_ALERT,  triggerAlert},
+        {MQTT_TOPIC_BIRDSONG, triggerBirdSong}};
+
+    auto command = commands.find(topic);
+    if (command != commands.end()) {
+        command->second();
+        return;
     }
+
 }
 
 void setupWiFi() {
@@ -600,29 +627,24 @@ void loop() {
 
         switch (ch) {
             case '1':
-                Serial.println("1 -> Triggering Doorbell (Ding-Dong)...");
-                soundSampleIndex = 0;
-                currentSound = SOUND_DOORBELL;
+                triggerDoorBell();
                 break;
             case '2':
-                Serial.println("2 -> Triggering Alert Beep...");
-                soundSampleIndex = 0;
-                currentSound = SOUND_ALERT;
+                triggerAlert();
                 break;
             case '3':
-                Serial.println("3 -> Triggering Random Birdsong...");
                 triggerBirdSong();
                 break;
             case '4':
-                printNetworkStatus();
-                break;
-            case '5':
                 Serial.println("5 -> Queuing TTS test...");
                 enqueueTTS("Alert system ready", 18);
                 break;
             case '0':
                 Serial.println("0 -> Stopped / Silence.");
                 currentSound = SOUND_NONE;
+                break;
+            case 'S':
+                printNetworkStatus();
                 break;
             default:
                 printMenu();
