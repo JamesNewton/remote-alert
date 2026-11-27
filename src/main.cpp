@@ -11,15 +11,69 @@
 #define DMA_BUF_LEN 256
 #define TTS_MAX_LEN 256
 #define TTS_QUEUE_LEN 4
+#define DAC_OUT_PIN 25
+#define IDLE_MUTE_DELAY_MS 500
+#define RAMP_DOWN_FRAMES 2
 
 AnalogAudioStream out;
 AnalogConfig audioConfig;
+bool audioActive = false;
+
+void clampDacLow() { //to avoid noise when the DAC is idle
+    pinMode(DAC_OUT_PIN, OUTPUT);
+    digitalWrite(DAC_OUT_PIN, LOW);
+}
 
 void restartAudio() {
     Serial.println("[Audio] Restarting AnalogAudioStream...");
     out.end();
     delay(10);
     out.begin(audioConfig);
+    audioActive = true;
+}
+
+void wakeAudio() {
+    if (audioActive) return;
+
+    out.begin(audioConfig);
+    audioActive = true;
+
+    // Short ~11.6 ms linear ramp from 0V (-32768) to mid-scale (0) to avoid turn-on pop
+    int16_t ramp[DMA_BUF_LEN];
+    for (int i = 0; i < DMA_BUF_LEN; i++) {
+        float frac = (float)(i + 1) / (float)DMA_BUF_LEN;
+        ramp[i] = (int16_t)(-32768.0f * (1.0f - frac));
+    }
+    out.write((const uint8_t *)ramp, sizeof(ramp));
+}
+
+void muteAudio() {
+    if (!audioActive) return;
+
+    int16_t frame[DMA_BUF_LEN];
+    const int totalSamples = RAMP_DOWN_FRAMES * DMA_BUF_LEN;
+
+    // Gentle ~23.2 ms linear ramp from mid-scale (0) down to 0V (-32768)
+    for (int f = 0; f < RAMP_DOWN_FRAMES; f++) {
+        for (int i = 0; i < DMA_BUF_LEN; i++) {
+            float frac = (float)(f * DMA_BUF_LEN + i + 1) / (float)totalSamples;
+            frame[i] = (int16_t)(-32768.0f * frac);
+        }
+        out.write((const uint8_t *)frame, sizeof(frame));
+    }
+
+    // Push 0V frames to drain queued DMA descriptors before disabling the DAC
+    // (Refill each iteration because AnalogDriverESP32V1 converts the buffer in-place)
+    for (int f = 0; f < audioConfig.buffer_count; f++) {
+        for (int i = 0; i < DMA_BUF_LEN; i++) {
+            frame[i] = -32768;
+        }
+        out.write((const uint8_t *)frame, sizeof(frame));
+    }
+
+    out.end();
+    clampDacLow();
+    audioActive = false;
 }
 
 // Buffers TTS audio into exact DMA_BUF_LEN-sample (512-byte) frames so
@@ -118,8 +172,8 @@ void setupAudio() {
     audioConfig.channels = 1;
     audioConfig.bits_per_sample = 16;
     audioConfig.timeout = pdMS_TO_TICKS(500);
-    out.begin(audioConfig);
-    Serial.printf("[Audio] AnalogAudioStream started (buf_size=%d, buf_count=%d)\n",
+    clampDacLow();
+    Serial.printf("[Audio] AnalogAudioStream configured (idle-muted, buf_size=%d, buf_count=%d)\n",
                   audioConfig.buffer_size, audioConfig.buffer_count);
 
     espeakReady = espeak.begin(50);
@@ -171,6 +225,7 @@ void AudioTask(void *pvParameters) {
     float birdFreq = 0.0f;
     float birdGain = 0.0f;
     int birdCurrentChirp = 0;
+    unsigned long idleSinceMs = 0;
 
     while (true) {
         // Process any queued TTS message exclusively from AudioTask to avoid concurrent out.write()
@@ -178,6 +233,7 @@ void AudioTask(void *pvParameters) {
         if (ttsQueue != nullptr && xQueueReceive(ttsQueue, &ttsMsg, 0) == pdTRUE) {
             currentSound = SOUND_NONE;
             if (espeakReady) {
+                wakeAudio();
                 Serial.printf("[TTS] Speaking: %s (Stack HWM: %u, Free Heap: %u)\n",
                               ttsMsg.text,
                               (unsigned int)uxTaskGetStackHighWaterMark(NULL),
@@ -191,9 +247,29 @@ void AudioTask(void *pvParameters) {
                 if (!ok) {
                     Serial.println("[TTS] ERROR: espeak.say() failed.");
                 }
+                idleSinceMs = millis();
             }
             continue;
         }
+
+        if (currentSound == SOUND_NONE) {
+            if (audioActive) {
+                if ((millis() - idleSinceMs) >= IDLE_MUTE_DELAY_MS) {
+                    muteAudio();
+                } else {
+                    memset(buffer, 0, sizeof(buffer));
+                    if (out.write((const uint8_t *)buffer, sizeof(buffer)) == 0) {
+                        Serial.println("[Audio] ERROR: out.write() timed out, recovering audio...");
+                        restartAudio();
+                    }
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            continue;
+        }
+
+        wakeAudio();
 
         for (int i = 0; i < DMA_BUF_LEN; i++) {
             float outSample = 0.0f;
@@ -305,6 +381,7 @@ void AudioTask(void *pvParameters) {
             Serial.println("[Audio] ERROR: out.write() timed out, recovering audio...");
             restartAudio();
         }
+        idleSinceMs = millis();
     }
 }
 
@@ -411,6 +488,7 @@ void setupWiFi() {
     }
     Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); //power isn't an issue. Avoid spikes which cause audio pops.
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
