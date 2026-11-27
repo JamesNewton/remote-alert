@@ -23,3 +23,5 @@
 #define MQTT_TOPIC_DOORBELL MQTT_TOPIC "/doorbell"
 #define MQTT_TOPIC_ALERT MQTT_TOPIC "/alert"
 #define MQTT_TOPIC_BIRDSONG MQTT_TOPIC "/birdsong"
+#define MQTT_TOPIC_CRICKET MQTT_TOPIC "/cricket"
+#define MQTT_TOPIC_CHICKEN MQTT_TOPIC "/chicken"

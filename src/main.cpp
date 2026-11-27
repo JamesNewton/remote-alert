@@ -145,7 +145,9 @@ enum SoundType {
     SOUND_NONE, 
     SOUND_DOORBELL,
     SOUND_ALERT,
-    SOUND_BIRDSONG
+    SOUND_BIRDSONG,
+    SOUND_CRICKET,
+    SOUND_CHICKEN
 };
 
 volatile SoundType currentSound = SOUND_NONE;
@@ -165,6 +167,44 @@ struct BirdChirp {
 
 BirdChirp birdChirps[MAX_BIRD_CHIRPS];
 int birdTotalChirps = 0;
+
+// Cricket chirp configuration
+#define MAX_CRICKET_PULSES 16
+struct CricketPulse {
+    uint32_t startSample;
+    uint32_t attackEndSample;
+    uint32_t decayStartSample;
+    uint32_t endSample;
+    float attackStep;
+    float decayStep;
+};
+
+CricketPulse cricketPulses[MAX_CRICKET_PULSES];
+int cricketTotalPulses = 0;
+float cricketPhaseStep = 2.0f * M_PI * 4300.0f / SAMPLE_RATE;
+
+// Chicken cluck configuration (ported from Web Audio dual-triangle + 3kHz bandpass)
+#define MAX_CHICKEN_CLUCKS 8
+struct ChickenCluck {
+    uint32_t startSample;
+    uint32_t peakSample;
+    uint32_t attackEndSample;
+    uint32_t endSample;
+    float freq;
+    float freqRiseMult;
+    float freqFallMult;
+    float gain;
+    float attackStep;
+    float decayMult;
+    float phase1;
+    float phase2;
+    float z1;
+    float z2;
+};
+
+ChickenCluck chickenClucks[MAX_CHICKEN_CLUCKS];
+int chickenTotalClucks = 0;
+uint32_t chickenEndSample = 0;
 
 void setupAudio() {
     audioConfig = out.defaultConfig(TX_MODE);
@@ -225,6 +265,23 @@ void AudioTask(void *pvParameters) {
     float birdFreq = 0.0f;
     float birdGain = 0.0f;
     int birdCurrentChirp = 0;
+
+    // Cricket state
+    float cricketPhase = 0.0f;
+    float cricketEnv = 0.0f;
+    int cricketCurrentPulse = 0;
+
+    // Chicken bandpass biquad coefficients (fc = 3000Hz, Q = 2.0, Web Audio constant-0dB bandpass)
+    const float bpW0 = 2.0f * M_PI * 3000.0f / SAMPLE_RATE;
+    const float bpAlpha = sinf(bpW0) / (2.0f * 2.0f);
+    const float bpA0 = 1.0f + bpAlpha;
+    const float bpB0 = bpAlpha / bpA0;
+    const float bpB2 = -bpB0;
+    const float bpA1 = (-2.0f * cosf(bpW0)) / bpA0;
+    const float bpA2 = (1.0f - bpAlpha) / bpA0;
+    const float chickenDetuneRatio = powf(2.0f, 15.0f / 1200.0f); // +15 cents
+    const float invSampleRate = 1.0f / SAMPLE_RATE;
+
     unsigned long idleSinceMs = 0;
 
     while (true) {
@@ -370,6 +427,84 @@ void AudioTask(void *pvParameters) {
                 if (birdTotalChirps > 0 && soundSampleIndex > birdChirps[birdTotalChirps - 1].endSample + (uint32_t)(0.1f * SAMPLE_RATE)) {
                     currentSound = SOUND_NONE;
                 }
+            } else if (currentSound == SOUND_CRICKET) {
+                if (soundSampleIndex == 0) {
+                    cricketPhase = 0.0f;
+                    cricketEnv = 0.0f;
+                    cricketCurrentPulse = 0;
+                }
+
+                while (cricketCurrentPulse < cricketTotalPulses && soundSampleIndex >= cricketPulses[cricketCurrentPulse].endSample) {
+                    cricketCurrentPulse++;
+                    cricketEnv = 0.0f;
+                }
+
+                if (cricketCurrentPulse < cricketTotalPulses && soundSampleIndex >= cricketPulses[cricketCurrentPulse].startSample) {
+                    CricketPulse &p = cricketPulses[cricketCurrentPulse];
+                    if (soundSampleIndex < p.attackEndSample) {
+                        cricketEnv += p.attackStep;
+                        if (cricketEnv > 1.0f) cricketEnv = 1.0f;
+                    } else if (soundSampleIndex >= p.decayStartSample) {
+                        cricketEnv -= p.decayStep;
+                        if (cricketEnv < 0.0f) cricketEnv = 0.0f;
+                    }
+
+                    cricketPhase += cricketPhaseStep;
+                    if (cricketPhase >= 2.0f * M_PI) cricketPhase -= 2.0f * M_PI;
+                    outSample = sinf(cricketPhase) * cricketEnv * 0.02f;//0.65f;
+                }
+
+                soundSampleIndex = soundSampleIndex + 1;
+                if (cricketTotalPulses > 0 && soundSampleIndex > cricketPulses[cricketTotalPulses - 1].endSample + (uint32_t)(0.05f * SAMPLE_RATE)) {
+                    currentSound = SOUND_NONE;
+                }
+            } else if (currentSound == SOUND_CHICKEN) {
+                float mix = 0.0f;
+                for (int cIdx = 0; cIdx < chickenTotalClucks; cIdx++) {
+                    ChickenCluck &c = chickenClucks[cIdx];
+                    if (soundSampleIndex < c.startSample || soundSampleIndex >= c.endSample) {
+                        continue;
+                    }
+
+                    // Dual detuned triangle oscillators
+                    float tri1 = (c.phase1 < 0.5f) ? (4.0f * c.phase1 - 1.0f) : (3.0f - 4.0f * c.phase1);
+                    float tri2 = (c.phase2 < 0.5f) ? (4.0f * c.phase2 - 1.0f) : (3.0f - 4.0f * c.phase2);
+                    float x = tri1 + tri2;
+
+                    // 3kHz Q=2 bandpass biquad (Transposed Direct Form II)
+                    float y = bpB0 * x + c.z1;
+                    c.z1 = -bpA1 * y + c.z2;
+                    c.z2 = bpB2 * x - bpA2 * y;
+
+                    mix += y * c.gain;
+
+                    // Advance oscillator phases
+                    c.phase1 += c.freq * invSampleRate;
+                    if (c.phase1 >= 1.0f) c.phase1 -= 1.0f;
+                    c.phase2 += c.freq * chickenDetuneRatio * invSampleRate;
+                    if (c.phase2 >= 1.0f) c.phase2 -= 1.0f;
+
+                    // Exponential pitch profile (rise to 2.2x, then drop to 0.7x)
+                    if (soundSampleIndex < c.peakSample) {
+                        c.freq *= c.freqRiseMult;
+                    } else {
+                        c.freq *= c.freqFallMult;
+                    }
+
+                    // Snappy linear attack + exponential decay envelope
+                    if (soundSampleIndex < c.attackEndSample) {
+                        c.gain += c.attackStep;
+                    } else {
+                        c.gain *= c.decayMult;
+                    }
+                }
+
+                // Makeup gain so filtered upper harmonics match the volume of other effects
+                outSample = mix * 2.5f;
+                soundSampleIndex = soundSampleIndex + 1;
+                if (soundSampleIndex > chickenEndSample) {
+                    currentSound = SOUND_NONE;
+                }
             }
 
             // Convert [-1.0, 1.0] float signal to 16-bit signed PCM
@@ -440,6 +575,102 @@ void triggerBirdSong() {
     currentSound = SOUND_BIRDSONG;
 }
 
+// Generates a realistic field-cricket chirp burst (2-3 chirps of 3-4 rapid syllables)
+void triggerCricket() {
+    Serial.println("Cricket");
+    currentSound = SOUND_NONE;
+
+    float carrierFreq = 4200.0f + ((float)rand() / RAND_MAX) * 300.0f;
+    cricketPhaseStep = 2.0f * M_PI * carrierFreq / SAMPLE_RATE;
+
+    int chirpCount = 1 + (rand() % 2); // 1 to 2 chirps
+    int pulsesPerChirp = 3 + (rand() % 2); // 3 to 4 syllables per chirp
+    if (chirpCount * pulsesPerChirp > MAX_CRICKET_PULSES) {
+        pulsesPerChirp = MAX_CRICKET_PULSES / chirpCount;
+    }
+
+    const uint32_t pulseSamples = (uint32_t)(0.018f * SAMPLE_RATE); // 18ms syllable
+    const uint32_t attackSamples = (uint32_t)(0.003f * SAMPLE_RATE); // 3ms ramp up
+    const uint32_t decaySamples = (uint32_t)(0.005f * SAMPLE_RATE); // 5ms ramp down
+    const uint32_t pulseGapSamples = (uint32_t)(0.014f * SAMPLE_RATE); // 14ms between syllables
+    const uint32_t chirpGapSamples = (uint32_t)(0.200f * SAMPLE_RATE); // 200ms between chirps
+
+    uint32_t curSample = (uint32_t)(0.02f * SAMPLE_RATE);
+    int idx = 0;
+    for (int c = 0; c < chirpCount; c++) {
+        for (int p = 0; p < pulsesPerChirp; p++) {
+            CricketPulse &pulse = cricketPulses[idx++];
+            pulse.startSample = curSample;
+            pulse.attackEndSample = curSample + attackSamples;
+            pulse.decayStartSample = curSample + pulseSamples - decaySamples;
+            pulse.endSample = curSample + pulseSamples;
+            pulse.attackStep = 1.0f / (float)attackSamples;
+            pulse.decayStep = 1.0f / (float)decaySamples;
+            curSample = pulse.endSample + pulseGapSamples;
+        }
+        curSample += chirpGapSamples;
+    }
+
+    cricketTotalPulses = idx;
+    soundSampleIndex = 0;
+    currentSound = SOUND_CRICKET;
+}
+
+// Generates a randomized burst of angry chicken clucks (5-6 clucks)
+void triggerChicken() {
+    Serial.println("Chicken");
+    currentSound = SOUND_NONE;
+
+    int burstCount = 5 + (rand() % 2); // 5 to 6 clucks
+    if (burstCount > MAX_CHICKEN_CLUCKS) burstCount = MAX_CHICKEN_CLUCKS;
+
+    uint32_t curSample = (uint32_t)(0.02f * SAMPLE_RATE);
+    uint32_t maxEnd = curSample;
+
+    for (int i = 0; i < burstCount; i++) {
+        ChickenCluck &c = chickenClucks[i];
+        float baseFreq = 400.0f + ((float)rand() / RAND_MAX) * 100.0f;
+        float duration = 0.06f + ((float)rand() / RAND_MAX) * 0.04f;
+        uint32_t durationSamples = (uint32_t)(duration * SAMPLE_RATE);
+        if (durationSamples < 200) durationSamples = 200;
+
+        uint32_t riseSamples = (uint32_t)(durationSamples * 0.3f);
+        if (riseSamples < 10) riseSamples = 10;
+        uint32_t fallSamples = durationSamples - riseSamples;
+        if (fallSamples < 10) fallSamples = 10;
+
+        uint32_t attackSamples = (uint32_t)(0.005f * SAMPLE_RATE);
+        if (attackSamples < 5) attackSamples = 5;
+        if (attackSamples >= durationSamples) attackSamples = durationSamples / 2;
+        uint32_t decaySamples = durationSamples - attackSamples;
+
+        c.startSample = curSample;
+        c.peakSample = curSample + riseSamples;
+        c.attackEndSample = curSample + attackSamples;
+        c.endSample = curSample + durationSamples;
+        c.freq = baseFreq;
+        c.freqRiseMult = powf(2.2f, 1.0f / (float)riseSamples);
+        c.freqFallMult = powf(0.7f / 2.2f, 1.0f / (float)fallSamples);
+        c.gain = 0.0f;
+        c.attackStep = 0.5f / (float)attackSamples;
+        c.decayMult = powf(0.001f / 0.5f, 1.0f / (float)decaySamples);
+        c.phase1 = 0.0f;
+        c.phase2 = 0.0f;
+        c.z1 = 0.0f;
+        c.z2 = 0.0f;
+
+        if (c.endSample > maxEnd) maxEnd = c.endSample;
+
+        float spacing = 0.08f + ((float)rand() / RAND_MAX) * 0.12f;
+        curSample += (uint32_t)(spacing * SAMPLE_RATE);
+    }
+
+    chickenTotalClucks = burstCount;
+    chickenEndSample = maxEnd + (uint32_t)(0.05f * SAMPLE_RATE);
+    soundSampleIndex = 0;
+    currentSound = SOUND_CHICKEN;
+}
+
 void enqueueTTS(const char* text, unsigned int length) {
     if (ttsQueue == nullptr || !espeakReady || text == nullptr || length == 0) return;
 
@@ -495,10 +726,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         triggerBirdSong();
     } */
 
-    std::unordered_map<std::string, std::function<void()>> commands = {
+    static const std::unordered_map<std::string, std::function<void()>> commands = {
         {MQTT_TOPIC_DOORBELL, triggerDoorBell},
-        {MQTT_TOPIC_ALERT,  triggerAlert},
-        {MQTT_TOPIC_BIRDSONG, triggerBirdSong}};
+        {MQTT_TOPIC_ALERT, triggerAlert},
+        {MQTT_TOPIC_BIRDSONG, triggerBirdSong},
+        {MQTT_TOPIC_CRICKET, triggerCricket},
+        {MQTT_TOPIC_CHICKEN, triggerChicken}};
 
     auto command = commands.find(topic);
     if (command != commands.end()) {
@@ -592,8 +825,10 @@ void printMenu() {
     Serial.println(" [1] Play Doorbell (Ding-Dong)");
     Serial.println(" [2] Play Double Alert Beep");
     Serial.println(" [3] Play Random Birdsong (Synthesized Chirps)");
-    Serial.println(" [4] Network / MQTT Status");
-    Serial.println(" [5] Test TTS (\"Alert system ready\")");
+    Serial.println(" [4] Play Cricket");
+    Serial.println(" [5] Play Angry Chicken Clucking");
+    Serial.println(" [6] Test TTS (\"Alert system ready\")");
+    Serial.println(" [S] Network / MQTT Status");
     Serial.println(" [0] Stop / Silence");
     Serial.println("-------------------------------");
     Serial.print("Enter choice: ");
@@ -636,7 +871,13 @@ void loop() {
                 triggerBirdSong();
                 break;
             case '4':
-                Serial.println("5 -> Queuing TTS test...");
+                triggerCricket();
+                break;
+            case '5':
+                triggerChicken();
+                break;
+            case '6':
+                Serial.println("6 -> Queuing TTS test...");
                 enqueueTTS("Alert system ready", 18);
                 break;
             case '0':
@@ -644,6 +885,7 @@ void loop() {
                 currentSound = SOUND_NONE;
                 break;
             case 'S':
+            case 's':
                 printNetworkStatus();
                 break;
             default:
